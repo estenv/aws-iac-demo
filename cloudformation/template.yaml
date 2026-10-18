@@ -1,0 +1,269 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Load-balanced auto-scaling HTTP web service: security groups, a launch
+  template, an internet-facing ALB with target group and listener, a 1-3
+  instance auto scaling group, and two CPU step-scaling policies with alarms.
+
+  VpcId and SubnetIds are parameters: CloudFormation cannot discover the
+  default VPC's subnets.
+
+Parameters:
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-06174c8686ce68c26
+    Description: Pre-baked web server image (us-east-1, x86_64).
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type for the auto scaling group.
+  KeyName:
+    Type: String
+    Default: ''
+    Description: Optional SSH key pair name. Leave empty (no SSH is needed).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Default VPC id (discovered by deploy.sh).
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Default VPC subnets, spanning at least two AZs.
+  AllowedCidr:
+    Type: String
+    Default: 203.0.113.0/24
+    Description: CIDR allowed to reach the ALB on port 80 (the deploying host's public IP).
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+
+Resources:
+
+  # 1. ALB security group: inbound HTTP from the deploying host only.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cf-alb-sg
+      GroupDescription: cf ALB - inbound HTTP from the deploying host
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCidr
+      Tags:
+        - Key: Name
+          Value: cf-alb-sg
+        - Key: Project
+          Value: iac-demo
+        - Key: ProvisionedBy
+          Value: cloudformation
+
+  # 2. Instance security group: inbound HTTP from the ALB security group only.
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cf-ec2-sg
+      GroupDescription: cf EC2 - inbound HTTP from the ALB security group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt AlbSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: cf-ec2-sg
+        - Key: Project
+          Value: iac-demo
+        - Key: ProvisionedBy
+          Value: cloudformation
+
+  # 3. Launch template.
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: cf-lt
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !GetAtt Ec2SecurityGroup.GroupId
+        KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: cf-lt
+            - Key: Project
+              Value: iac-demo
+            - Key: ProvisionedBy
+              Value: cloudformation
+
+  # 4. Target group.
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: cf-tg
+      TargetType: instance
+      Protocol: HTTP
+      Port: 80
+      ProtocolVersion: HTTP1
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health.php
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: cf-tg
+        - Key: Project
+          Value: iac-demo
+        - Key: ProvisionedBy
+          Value: cloudformation
+
+  # 5. Internet-facing Application Load Balancer.
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: cf-alb
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !GetAtt AlbSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: cf-alb
+        - Key: Project
+          Value: iac-demo
+        - Key: ProvisionedBy
+          Value: cloudformation
+
+  # 6. HTTP listener forwarding to the target group.
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # 7. Auto scaling group (1-3 instances, ELB health checks).
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: cf-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier: !Ref SubnetIds
+      MinSize: '1'
+      MaxSize: '3'
+      DesiredCapacity: '1'
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: cf-asg
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: iac-demo
+          PropagateAtLaunch: true
+        - Key: ProvisionedBy
+          Value: cloudformation
+          PropagateAtLaunch: true
+
+  # 8. High CPU alarm.
+  CpuHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: cf-cpu-high
+      AlarmDescription: Scale out when average CPU exceeds 40% for 5 minutes
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 40
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      AlarmActions:
+        - !Ref ScaleOutPolicy
+      Tags:
+        - Key: Project
+          Value: iac-demo
+        - Key: ProvisionedBy
+          Value: cloudformation
+
+  # 9. Low CPU alarm.
+  CpuLowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: cf-cpu-low
+      AlarmDescription: Scale in when average CPU is below 10% for 5 minutes
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      ComparisonOperator: LessThanThreshold
+      Threshold: 10
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      AlarmActions:
+        - !Ref ScaleInPolicy
+      Tags:
+        - Key: Project
+          Value: iac-demo
+        - Key: ProvisionedBy
+          Value: cloudformation
+
+  # 10. Scale-out step policy (+1 when CPU >= 40).
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: cf-scale-out
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      MetricAggregationType: Average
+      EstimatedInstanceWarmup: 300
+      StepAdjustments:
+        - MetricIntervalLowerBound: 40
+          ScalingAdjustment: 1
+
+  # 11. Scale-in step policy (-1 when CPU <= 10).
+  ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: cf-scale-in
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      MetricAggregationType: Average
+      EstimatedInstanceWarmup: 300
+      StepAdjustments:
+        # An upper-bounded step requires a following unbounded step.
+        - MetricIntervalUpperBound: 10
+          ScalingAdjustment: -1
+        - MetricIntervalLowerBound: 10
+          ScalingAdjustment: 0
+
+Outputs:
+  LoadBalancerDnsName:
+    Description: Public DNS name of the ALB
+    Value: !GetAtt LoadBalancer.DNSName
+  TargetGroupArn:
+    Description: ARN of the target group
+    Value: !Ref TargetGroup
+  AutoScalingGroupName:
+    Description: Name of the auto scaling group
+    Value: !Ref AutoScalingGroup

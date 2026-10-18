@@ -1,0 +1,12 @@
+{
+  "name": "iac-demo-cdk",
+  "private": true,
+  "devDependencies": {
+    "aws-cdk": "^2",
+    "aws-cdk-lib": "^2",
+    "constructs": "^10",
+    "typescript": "^5",
+    "ts-node": "^10",
+    "@types/node": "^22"
+  }
+}
